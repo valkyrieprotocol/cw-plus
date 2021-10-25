@@ -2,7 +2,7 @@ use cosmwasm_std::Coin;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cw0::NativeBalance;
+use utils::NativeBalance;
 
 use crate::Cw20CoinVerified;
 
