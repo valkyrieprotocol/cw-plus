@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use cosmwasm_std::{from_slice, Binary, Order, Record, StdError, StdResult, Storage};
 
+use crate::bound::PrefixBound;
 use crate::de::KeyDeserialize;
 use crate::iter_helpers::deserialize_kv;
 use crate::map::Map;
-use crate::prefix::{namespaced_prefix_range, PrefixBound};
+use crate::prefix::namespaced_prefix_range;
 use crate::{Bound, Index, Prefix, Prefixer, PrimaryKey};
 
 /// UniqueRef stores Binary(Vec[u8]) representation of private key and index value
@@ -25,14 +26,14 @@ pub(crate) struct UniqueRef<T> {
 /// UniqueIndex stores (namespace, index_name, idx_value) -> {key, value}
 /// Allows one value per index (i.e. unique) and copies pk and data
 /// The optional PK type defines the type of Primary Key deserialization.
-pub struct UniqueIndex<'a, K, T, PK = ()> {
-    index: fn(&T) -> K,
-    idx_map: Map<'a, K, UniqueRef<T>>,
+pub struct UniqueIndex<'a, IK, T, PK = ()> {
+    index: fn(&T) -> IK,
+    idx_map: Map<'a, IK, UniqueRef<T>>,
     idx_namespace: &'a [u8],
-    _phantom: PhantomData<PK>,
+    phantom: PhantomData<PK>,
 }
 
-impl<'a, K, T, PK> UniqueIndex<'a, K, T, PK> {
+impl<'a, IK, T, PK> UniqueIndex<'a, IK, T, PK> {
     // TODO: make this a const fn
     /// Create a new UniqueIndex
     ///
@@ -51,20 +52,20 @@ impl<'a, K, T, PK> UniqueIndex<'a, K, T, PK> {
     ///
     /// UniqueIndex::<_, _, ()>::new(|d: &Data| d.age, "data__age");
     /// ```
-    pub fn new(idx_fn: fn(&T) -> K, idx_namespace: &'a str) -> Self {
+    pub fn new(idx_fn: fn(&T) -> IK, idx_namespace: &'a str) -> Self {
         UniqueIndex {
             index: idx_fn,
             idx_map: Map::new(idx_namespace),
             idx_namespace: idx_namespace.as_bytes(),
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 }
 
-impl<'a, K, T, PK> Index<T> for UniqueIndex<'a, K, T, PK>
+impl<'a, IK, T, PK> Index<T> for UniqueIndex<'a, IK, T, PK>
 where
     T: Serialize + DeserializeOwned + Clone,
-    K: PrimaryKey<'a>,
+    IK: PrimaryKey<'a>,
 {
     fn save(&self, store: &mut dyn Storage, pk: &[u8], data: &T) -> StdResult<()> {
         let idx = (self.index)(data);
@@ -92,8 +93,7 @@ where
 fn deserialize_unique_v<T: DeserializeOwned>(kv: Record) -> StdResult<Record<T>> {
     let (_, v) = kv;
     let t = from_slice::<UniqueRef<T>>(&v)?;
-    // FIXME: Return `k` here instead of `t.pk` (be consistent with `Map` behaviour)
-    Ok((t.pk.to_vec(), t.value))
+    Ok((t.pk.0, t.value))
 }
 
 fn deserialize_unique_kv<K: KeyDeserialize, T: DeserializeOwned>(
@@ -101,39 +101,30 @@ fn deserialize_unique_kv<K: KeyDeserialize, T: DeserializeOwned>(
 ) -> StdResult<(K::Output, T)> {
     let (_, v) = kv;
     let t = from_slice::<UniqueRef<T>>(&v)?;
-    // FIXME: Return `k` deserialization here instead of `t.pk` (be consistent with `deserialize_multi_kv` and `Map` behaviour)
-    Ok((K::from_vec(t.pk.to_vec())?, t.value))
+    Ok((K::from_vec(t.pk.0)?, t.value))
 }
 
-impl<'a, K, T, PK> UniqueIndex<'a, K, T, PK>
+impl<'a, IK, T, PK> UniqueIndex<'a, IK, T, PK>
 where
     T: Serialize + DeserializeOwned + Clone,
-    K: PrimaryKey<'a>,
+    IK: PrimaryKey<'a>,
 {
-    pub fn index_key(&self, k: K) -> Vec<u8> {
+    pub fn index_key(&self, k: IK) -> Vec<u8> {
         k.joined_key()
     }
 
-    pub fn prefix(&self, p: K::Prefix) -> Prefix<Vec<u8>, T> {
-        Prefix::with_deserialization_function(self.idx_namespace, &p.prefix(), &[], |_, _, kv| {
-            deserialize_unique_v(kv)
-        })
-    }
-
-    pub fn sub_prefix(&self, p: K::SubPrefix) -> Prefix<Vec<u8>, T> {
-        Prefix::with_deserialization_function(self.idx_namespace, &p.prefix(), &[], |_, _, kv| {
-            deserialize_unique_v(kv)
-        })
-    }
-
-    fn no_prefix(&self) -> Prefix<Vec<u8>, T> {
-        Prefix::with_deserialization_function(self.idx_namespace, &[], &[], |_, _, kv| {
-            deserialize_unique_v(kv)
-        })
+    fn no_prefix_raw(&self) -> Prefix<Vec<u8>, T, IK> {
+        Prefix::with_deserialization_functions(
+            self.idx_namespace,
+            &[],
+            &[],
+            |_, _, kv| deserialize_unique_v(kv),
+            |_, _, kv| deserialize_unique_v(kv),
+        )
     }
 
     /// returns all items that match this secondary index, always by pk Ascending
-    pub fn item(&self, store: &dyn Storage, idx: K) -> StdResult<Option<Record<T>>> {
+    pub fn item(&self, store: &dyn Storage, idx: IK) -> StdResult<Option<Record<T>>> {
         let data = self
             .idx_map
             .may_load(store, idx)?
@@ -142,62 +133,62 @@ where
     }
 }
 
-// short-cut for simple keys, rather than .prefix(()).range(...)
-impl<'a, K, T, PK> UniqueIndex<'a, K, T, PK>
+// short-cut for simple keys, rather than .prefix(()).range_raw(...)
+impl<'a, IK, T, PK> UniqueIndex<'a, IK, T, PK>
 where
     T: Serialize + DeserializeOwned + Clone,
-    K: PrimaryKey<'a>,
+    IK: PrimaryKey<'a>,
 {
     // I would prefer not to copy code from Prefix, but no other way
     // with lifetimes (create Prefix inside function and return ref = no no)
-    pub fn range<'c>(
+    pub fn range_raw<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, IK>>,
+        max: Option<Bound<'a, IK>>,
         order: Order,
     ) -> Box<dyn Iterator<Item = StdResult<Record<T>>> + 'c>
     where
         T: 'c,
     {
-        self.no_prefix().range(store, min, max, order)
+        self.no_prefix_raw().range_raw(store, min, max, order)
     }
 
-    pub fn keys<'c>(
+    pub fn keys_raw<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, IK>>,
+        max: Option<Bound<'a, IK>>,
         order: Order,
     ) -> Box<dyn Iterator<Item = Vec<u8>> + 'c> {
-        self.no_prefix().keys(store, min, max, order)
+        self.no_prefix_raw().keys_raw(store, min, max, order)
     }
 }
 
 #[cfg(feature = "iterator")]
-impl<'a, K, T, PK> UniqueIndex<'a, K, T, PK>
+impl<'a, IK, T, PK> UniqueIndex<'a, IK, T, PK>
 where
     PK: PrimaryKey<'a> + KeyDeserialize,
     T: Serialize + DeserializeOwned + Clone,
-    K: PrimaryKey<'a>,
+    IK: PrimaryKey<'a>,
 {
-    /// While `range_de` over a `prefix_de` fixes the prefix to one element and iterates over the
-    /// remaining, `prefix_range_de` accepts bounds for the lowest and highest elements of the
+    /// While `range` over a `prefix` fixes the prefix to one element and iterates over the
+    /// remaining, `prefix_range` accepts bounds for the lowest and highest elements of the
     /// `Prefix` itself, and iterates over those (inclusively or exclusively, depending on
     /// `PrefixBound`).
     /// There are some issues that distinguish these two, and blindly casting to `Vec<u8>` doesn't
     /// solve them.
-    pub fn prefix_range_de<'c>(
+    pub fn prefix_range<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<PrefixBound<'a, PK::Prefix>>,
-        max: Option<PrefixBound<'a, PK::Prefix>>,
+        min: Option<PrefixBound<'a, IK::Prefix>>,
+        max: Option<PrefixBound<'a, IK::Prefix>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<(PK::Output, T)>> + 'c>
     where
         T: 'c,
         'a: 'c,
-        K: 'c,
+        IK: 'c,
         PK: 'c,
         PK::Output: 'static,
     {
@@ -206,49 +197,61 @@ where
         Box::new(mapped)
     }
 
-    pub fn range_de<'c>(
+    pub fn range<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, IK>>,
+        max: Option<Bound<'a, IK>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<(PK::Output, T)>> + 'c>
     where
         T: 'c,
         PK::Output: 'static,
     {
-        self.no_prefix_de().range_de(store, min, max, order)
+        self.no_prefix().range(store, min, max, order)
     }
 
-    pub fn keys_de<'c>(
+    pub fn keys<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, IK>>,
+        max: Option<Bound<'a, IK>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<PK::Output>> + 'c>
     where
         T: 'c,
         PK::Output: 'static,
     {
-        self.no_prefix_de().keys_de(store, min, max, order)
+        self.no_prefix().keys(store, min, max, order)
     }
 
-    pub fn prefix_de(&self, p: K::Prefix) -> Prefix<PK, T> {
-        Prefix::with_deserialization_function(self.idx_namespace, &p.prefix(), &[], |_, _, kv| {
-            deserialize_unique_kv::<PK, _>(kv)
-        })
+    pub fn prefix(&self, p: IK::Prefix) -> Prefix<PK, T, IK::Suffix> {
+        Prefix::with_deserialization_functions(
+            self.idx_namespace,
+            &p.prefix(),
+            &[],
+            |_, _, kv| deserialize_unique_kv::<PK, _>(kv),
+            |_, _, kv| deserialize_unique_v(kv),
+        )
     }
 
-    pub fn sub_prefix_de(&self, p: K::SubPrefix) -> Prefix<PK, T> {
-        Prefix::with_deserialization_function(self.idx_namespace, &p.prefix(), &[], |_, _, kv| {
-            deserialize_unique_kv::<PK, _>(kv)
-        })
+    pub fn sub_prefix(&self, p: IK::SubPrefix) -> Prefix<PK, T, IK::SuperSuffix> {
+        Prefix::with_deserialization_functions(
+            self.idx_namespace,
+            &p.prefix(),
+            &[],
+            |_, _, kv| deserialize_unique_kv::<PK, _>(kv),
+            |_, _, kv| deserialize_unique_v(kv),
+        )
     }
 
-    fn no_prefix_de(&self) -> Prefix<PK, T> {
-        Prefix::with_deserialization_function(self.idx_namespace, &[], &[], |_, _, kv| {
-            deserialize_unique_kv::<PK, _>(kv)
-        })
+    fn no_prefix(&self) -> Prefix<PK, T, IK> {
+        Prefix::with_deserialization_functions(
+            self.idx_namespace,
+            &[],
+            &[],
+            |_, _, kv| deserialize_unique_kv::<PK, _>(kv),
+            |_, _, kv| deserialize_unique_v(kv),
+        )
     }
 }

@@ -1,15 +1,25 @@
-# CW-Storage-Plus: Enhanced/experimental storage engines for CosmWasm
+# CW-Storage-Plus: Enhanced storage engines for CosmWasm
 
-The ideas in here are based on the `cosmwasm-storage` crate. However,
-after much usage, we decided a complete rewrite could allow us to add
-more powerful and easy to use interfaces. Here are those interfaces.
+After building `cosmwasm-storage`, we realized many of the design decisions were
+limiting us and producing a lot of needless boilerplate. The decision was made to leave
+those APIs stable for anyone wanting a very basic abstraction on the KV-store and to
+build a much more powerful and complex ORM layer that can provide powerful accessors
+using complex key types, which are transparently turned into bytes.
+
+This led to a number of breaking API changes in this package of the course of several
+releases as we updated this with lots of experience, user feedback, and deep dives to harness
+the full power of generics.
 
 **Status: beta**
 
-This has been heavily used in many production-quality contracts and
-heavily refined. There is one planned API break (dealing with
-auto-deserializing keys in range queries), but the code has demonstrated
-itself to be stable and powerful. Please feel free to use in your contracts.
+As of `cw-storage-plus` `v0.12` the API should be quite stable.
+There are no major API breaking issues pending, and all API changes will be documented
+in [`MIGRATING.md`](../../MIGRATING.md).
+
+This has been heavily used in many production-quality contracts.
+The code has demonstrated itself to be stable and powerful.
+It has not been audited, and Confio assumes no liability, but we consider it mature enough
+to be the **standard storage layer** for your contracts.
 
 ## Usage Overview
 
@@ -98,14 +108,14 @@ fn demo() -> StdResult<()> {
 
 ## Map
 
-The usage of an [`Map`](./src/item.rs) is a little more complex, but
+The usage of a [`Map`](./src/map.rs) is a little more complex, but
 is still pretty straight-forward. You can imagine it as a storage-backed
 `BTreeMap`, allowing key-value lookups with typed values. In addition,
 we support not only simple binary keys (`&[u8]`), but tuples, which are
 combined. This allows us to store allowances as composite keys
 eg. `(owner, spender)` to look up the balance.
 
-Beyond direct lookups, we have a super power not found in Ethereum -
+Beyond direct lookups, we have a super-power not found in Ethereum -
 iteration. That's right, you can list all items in a `Map`, or only
 part of them. We can efficiently allow pagination over these items as
 well, starting at the point the last query ended, with low gas costs.
@@ -119,7 +129,7 @@ variants of the object, just one type. Furthermore, we use `const fn`
 to create the `Bucket`, allowing it to be defined as a global compile-time
 constant rather than a function that must be constructed each time,
 which saves gas as well as typing. In addition, the composite indexes
-(tuples) is more ergonomic and expressive of intention, and the range
+(tuples) are more ergonomic and expressive of intention, and the range
 interface has been improved.
 
 Here is an example with normal (simple) keys:
@@ -189,7 +199,7 @@ fn demo() -> StdResult<()> {
 ### Key types
 
 A `Map` key can be anything that implements the `PrimaryKey` trait. There are a series of implementations of
-`PrimaryKey` already provided (see `packages/storage-plus/src/keys.rs`):
+`PrimaryKey` already provided (see [keys.rs](./src/keys.rs)):
 
  - `impl<'a> PrimaryKey<'a> for &'a [u8]`
  - `impl<'a> PrimaryKey<'a> for &'a str`
@@ -199,22 +209,25 @@ A `Map` key can be anything that implements the `PrimaryKey` trait. There are a 
  - `impl<'a> PrimaryKey<'a> for &'a Addr`
  - `impl<'a, T: PrimaryKey<'a> + Prefixer<'a>, U: PrimaryKey<'a>> PrimaryKey<'a> for (T, U)`
  - `impl<'a, T: PrimaryKey<'a> + Prefixer<'a>, U: PrimaryKey<'a> + Prefixer<'a>, V: PrimaryKey<'a>> PrimaryKey<'a> for (T, U, V)`
- - `impl<'a, T: Endian + Clone> PrimaryKey<'a> for IntKey<T>`
+ - `PrimaryKey` implemented for unsigned integers up to `u64`
+ - `PrimaryKey` implemented for signed integers up to `i64`
 
 That means that byte and string slices, byte vectors, and strings, can be conveniently used as keys.
-Moreover, some other types can be used as well, like addresses and addresses references, pairs and triples, and
+Moreover, some other types can be used as well, like addresses and address references, pairs, triples, and
 integer types.
 
-If the key represents and address, we suggest using `&Addr` for keys in storage, instead of `String` or string slices. This implies doing address validation
-through `addr_validate` on any address passed in via a message, to ensure it's a legitimate address, and not random text
-which will fail later.
+If the key represents an address, we suggest using `&Addr` for keys in storage, instead of `String` or string slices.
+This implies doing address validation through `addr_validate` on any address passed in via a message, to ensure it's a
+legitimate address, and not random text which will fail later.
+`pub fn addr_validate(&self, &str) -> Addr` in `deps.api` can be used for address validation, and the returned `Addr`
+can then be conveniently used as key in a `Map` or similar structure.
 
-Thus, `pub fn addr_validate(&self, &str) -> Addr` in `deps.api` can be used for address validation, and the returned
-`Addr` can be conveniently used as key in a `Map` or similar structure.
+It's also convenient to use references (i.e. borrowed values) instead of values for keys (i.e. `&Addr` instead of `Addr`),
+as that will typically save some cloning during key reading / writing.
 
 ### Composite Keys
 
-There are times when we want to use multiple items as a key, for example, when
+There are times when we want to use multiple items as a key. For example, when
 storing allowances based on account owner and spender. We could try to manually
 concatenate them before calling, but that can lead to overlap, and is a bit
 low-level for us. Also, by explicitly separating the keys, we can easily provide
@@ -222,12 +235,12 @@ helpers to do range queries over a prefix, such as "show me all allowances for
 one owner" (first part of the composite key). Just like you'd expect from your
 favorite database.
 
-Here how we use it with composite keys. Just define a tuple as a key and use that
+Here's how we use it with composite keys. Just define a tuple as a key and use that
 everywhere you used a byte slice above.
 
 ```rust
-// Note the tuple for primary key. We support one slice, or a 2 or 3-tuple
-// adding longer tuples is quite easy but unlikely to be needed.
+// Note the tuple for primary key. We support one slice, or a 2 or 3-tuple.
+// Adding longer tuples is possible, but unlikely to be needed.
 const ALLOWANCE: Map<(&str, &str), u64> = Map::new("allow");
 
 fn demo() -> StdResult<()> {
@@ -260,12 +273,12 @@ fn demo() -> StdResult<()> {
 Under the scenes, we create a `Path` from the `Map` when accessing a key.
 `PEOPLE.load(&store, b"jack") == PEOPLE.key(b"jack").load()`.
 `Map.key()` returns a `Path`, which has the same interface as `Item`,
-reusing the calculated path to this key.
+re-using the calculated path to this key.
 
 For simple keys, this is just a bit less typing and a bit less gas if you
 use the same key for many calls. However, for composite keys, like
 `(b"owner", b"spender")` it is **much** less typing. And highly recommended anywhere
-you will use the a composite key even twice:
+you will use a composite key even twice:
 
 ```rust
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
@@ -297,7 +310,7 @@ fn demo() -> StdResult<()> {
     let empty = john.may_load(&store)?;
     assert_eq!(None, empty);
 
-    // Same for composite keys, just use both parts in key().
+    // Same for composite keys, just use both parts in `key()`.
     // Notice how much less verbose than the above example.
     let allow = ALLOWANCE.key(("owner", "spender"));
     allow.save(&mut store, &1234)?;
@@ -315,7 +328,7 @@ fn demo() -> StdResult<()> {
 
 In addition to getting one particular item out of a map, we can iterate over the map
 (or a subset of the map). This let us answer questions like "show me all tokens",
-and we provide some nice `Bound`s helpers to easily allow pagination or custom ranges.
+and we provide some nice [`Bound`](#bound) helpers to easily allow pagination or custom ranges.
 
 The general format is to get a `Prefix` by calling `map.prefix(k)`, where `k` is exactly
 one less item than the normal key (If `map.key()` took `(&[u8], &[u8])`, then `map.prefix()` takes `&[u8]`.
@@ -323,21 +336,28 @@ If `map.key()` took `&[u8]`, `map.prefix()` takes `()`). Once we have a prefix s
 over all items with `range(store, min, max, order)`. It supports `Order::Ascending` or `Order::Descending`.
 `min` is the lower bound and `max` is the higher bound.
 
+If the `min` and `max` bounds are `None`, `range` will return all items under the prefix. You can use `.take(n)` to
+limit the results to `n` items and start doing pagination. You can also set the `min` bound to
+eg. `Bound::exclusive(last_value)` to start iterating over all items *after* the last value. Combined with
+`take`, we easily have pagination support. You can also use `Bound::inclusive(x)` when you want to include any
+perfect matches.
+
+### Bound
+
+`Bound` is a helper to build type-safe bounds on the keys or sub-keys you want to iterate over.
+It also supports a raw (`Vec<u8>`) bounds specification, for the cases you don't want or can't use typed bounds.
+
 ```rust
-#[derive(Copy, Clone, Debug)]
-pub enum Bound {
-    Inclusive(Vec<u8>),
-    Exclusive(Vec<u8>),
-    None,
+#[derive(Clone, Debug)]
+pub enum Bound<'a, K: PrimaryKey<'a>> {
+  Inclusive((K, PhantomData<&'a bool>)),
+  Exclusive((K, PhantomData<&'a bool>)),
+  InclusiveRaw(Vec<u8>),
+  ExclusiveRaw(Vec<u8>),
 }
 ```
 
-If the `min` and `max` bounds, it will return all items under this prefix. You can use `.take(n)` to
-limit the results to `n` items and start doing pagination. You can also set the `min` bound to
-eg. `Bound::Exclusive(last_value)` to start iterating over all items *after* the last value. Combined with
-`take`, we easily have pagination support. You can also use `Bound::Inclusive(x)` when you want to include any
-perfect matches. To better understand the API, please read the following example:
-
+To better understand the API, please check the following example:
 ```rust
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 struct Data {
@@ -359,7 +379,7 @@ fn demo() -> StdResult<()> {
 
     // iterate over them all
     let all: StdResult<Vec<_>> = PEOPLE
-        .range(&store, Bound::None, Bound::None, Order::Ascending)
+        .range(&store, None, None, Order::Ascending)
         .collect();
     assert_eq!(
         all?,
@@ -370,8 +390,8 @@ fn demo() -> StdResult<()> {
     let all: StdResult<Vec<_>> = PEOPLE
         .range(
             &store,
-            Bound::Exclusive("jim"),
-            Bound::None,
+            Some(Bound::exclusive("jim")),
+            None,
             Order::Ascending,
         )
         .collect();
@@ -385,7 +405,7 @@ fn demo() -> StdResult<()> {
     // get all under one key
     let all: StdResult<Vec<_>> = ALLOWANCE
         .prefix("owner")
-        .range(&store, Bound::None, Bound::None, Order::Ascending)
+        .range(&store, None, None, Order::Ascending)
         .collect();
     assert_eq!(
         all?,
@@ -397,8 +417,8 @@ fn demo() -> StdResult<()> {
         .prefix("owner")
         .range(
             &store,
-            Bound::Exclusive("spender1"),
-            Bound::Inclusive("spender2"),
+            Some(Bound::exclusive("spender1")),
+            Some(Bound::inclusive("spender2")),
             Order::Descending,
         )
         .collect();
@@ -408,17 +428,18 @@ fn demo() -> StdResult<()> {
 }
 ```
 
+**NB**: For properly defining and using type-safe bounds over a `MultiIndex`, see [Type-safe bounds over `MultiIndex`](#type-safe-bounds-over-multiindex),
+below.
+
 ## IndexedMap
 
-In cw-plus, there's currently one example of `IndexedMap` usage, in the `cw721-base` contract.
-Let's use it to illustrate `IndexedMap` definition and usage.
+Let's see one example of `IndexedMap` definition and usage, originally taken from the `cw721-base` contract.
 
 ### Definition
 
 ```rust
 pub struct TokenIndexes<'a> {
-  // pk goes to second tuple element
-  pub owner: MultiIndex<'a, (Addr, Vec<u8>), TokenInfo>,
+  pub owner: MultiIndex<'a, Addr, TokenInfo, String>,
 }
 
 impl<'a> IndexList<TokenInfo> for TokenIndexes<'a> {
@@ -431,7 +452,7 @@ impl<'a> IndexList<TokenInfo> for TokenIndexes<'a> {
 pub fn tokens<'a>() -> IndexedMap<'a, &'a str, TokenInfo, TokenIndexes<'a>> {
   let indexes = TokenIndexes {
     owner: MultiIndex::new(
-      |d: &TokenInfo, k: Vec<u8>| (d.owner.clone(), k),
+      |d: &TokenInfo| d.owner.clone(),
       "tokens",
       "tokens__owner",
     ),
@@ -443,20 +464,18 @@ pub fn tokens<'a>() -> IndexedMap<'a, &'a str, TokenInfo, TokenIndexes<'a>> {
 Let's discuss this piece by piece:
 ```rust
 pub struct TokenIndexes<'a> {
-  // pk goes to second tuple element
-  pub owner: MultiIndex<'a, (Addr, Vec<u8>), TokenInfo>,
+  pub owner: MultiIndex<'a, Addr, TokenInfo, String>,
 }
 ```
 
 These are the index definitions. Here there's only one index, called `owner`. There could be more, as public
 members of the `TokenIndexes` struct.
-
-We see that the `owner` index is a `MultiIndex`. A multi-index can have repeated values as keys. That's why
-the primary key is being added as the last element of the multi-index key.
+We see that the `owner` index is a `MultiIndex`. A multi-index can have repeated values as keys. The primary key is
+used internally as the last element of the multi-index key, to disambiguate repeated index values.
 Like the name implies, this is an index over tokens, by owner. Given that an owner can have multiple tokens,
-we need a `MultiIndex` to be able to list / iterate over all the tokens a given owner has.
+we need a `MultiIndex` to be able to list / iterate over all the tokens he has.
 
-So, to recap, the `TokenInfo`  data will originally be stored by `token_id` (which is a string value).
+The `TokenInfo` data will originally be stored by `token_id` (which is a string value).
 You can see this in the token creation code:
 ```rust
     tokens().update(deps.storage, &msg.token_id, |old| match old {
@@ -466,46 +485,30 @@ You can see this in the token creation code:
 ```
 (Incidentally, this is using `update` instead of `save`, to avoid overwriting an already existing token).
 
-Then, it will be indexed by token `owner` (which is an `Addr`), so that we can list all the tokens an owner has.
-That's why the `owner` index key is `(Addr, Vec<u8>)`. The first owned element is the `owner` data
-, whereas the second one is the `token_id` (converted internally to `Vec<u8>`).
+Given that `token_id` is a string value, we specify `String` as the last argument of the `MultiIndex` definition.
+That way, the deserialization of the primary key will be done to the right type (an owned string).
 
-The important thing here is that the key (and its components, in the case of a combined key) must implement
-the `PrimaryKey` trait. You can see that the 2-tuple `(_, _)`, `Addr`, and `Vec<u8>` do implement `PrimaryKey`:
+**NB**: In the particular case of a `MultiIndex`, and with the latest implementation of type-safe bounds, the definition of
+this last type parameter is crucial, for properly using type-safe bounds.
+See [Type-safe bounds over `MultiIndex`](#type-safe-bounds-over-multiindex), below.
 
-```rust
-impl<'a, T: PrimaryKey<'a> + Prefixer<'a>, U: PrimaryKey<'a>> PrimaryKey<'a> for (T, U) {
-    type Prefix = T;
-    type SubPrefix = ();
+Then, this `TokenInfo` data will be indexed by token `owner` (which is an `Addr`). So that we can list all the tokens
+an owner has. That's why the `owner` index key is `Addr`.
 
-    fn key(&self) -> Vec<&[u8]> {
-        let mut keys = self.0.key();
-        keys.extend(&self.1.key());
-        keys
-    }
-}
-```
+Other important thing here is that the key (and its components, in the case of a composite key) must implement
+the `PrimaryKey` trait. You can see that `Addr` does implement `PrimaryKey`:
 
 ```rust
 impl<'a> PrimaryKey<'a> for Addr {
-    type Prefix = ();
-    type SubPrefix = ();
+  type Prefix = ();
+  type SubPrefix = ();
+  type Suffix = Self;
+  type SuperSuffix = Self;
 
-    fn key(&self) -> Vec<&[u8]> {
-        // this is simple, we don't add more prefixes
-        vec![self.as_bytes()]
-    }
-}
-```
-
-```rust
-impl<'a> PrimaryKey<'a> for Vec<u8> {
-    type Prefix = ();
-    type SubPrefix = ();
-
-    fn key(&self) -> Vec<&[u8]> {
-        vec![&self]
-    }
+  fn key(&self) -> Vec<Key> {
+    // this is simple, we don't add more prefixes
+    vec![Key::Ref(self.as_bytes())]
+  }
 }
 ```
 
@@ -523,9 +526,10 @@ impl<'a> IndexList<TokenInfo> for TokenIndexes<'a> {
 ```
 
 This implements the `IndexList` trait for `TokenIndexes`.
-Note: this code is more or less boiler-plate, and needed for the internals. Do not try to customize this;
+
+**NB**: this code is more or less boiler-plate, and needed for the internals. Do not try to customize this;
 just return a list of all indexes.
-Implementing this trait serves two purposes (which are really one, and the same): it allows the indexes
+Implementing this trait serves two purposes (which are really one and the same): it allows the indexes
 to be queried through `get_indexes`, and, it allows `TokenIndexes` to be treated as an `IndexList`. So that
 it can be passed as a parameter during `IndexedMap` construction, below:
 
@@ -533,7 +537,7 @@ it can be passed as a parameter during `IndexedMap` construction, below:
 pub fn tokens<'a>() -> IndexedMap<'a, &'a str, TokenInfo, TokenIndexes<'a>> {
     let indexes = TokenIndexes {
         owner: MultiIndex::new(
-            |d: &TokenInfo, k: Vec<u8>| (d.owner.clone(), k),
+            |d: &TokenInfo| d.owner.clone(),
             "tokens",
             "tokens__owner",
         ),
@@ -543,17 +547,14 @@ pub fn tokens<'a>() -> IndexedMap<'a, &'a str, TokenInfo, TokenIndexes<'a>> {
 ```
 
 Here `tokens()` is just a helper function, that simplifies the `IndexedMap` construction for us. First the
-index (es) is (are) created, and then, the `IndexedMap` is created (using `IndexedMap::new`), and returned.
+index (es) is (are) created, and then, the `IndexedMap` is created and returned.
 
 During index creation, we must supply an index function per index
 ```rust
-        owner: MultiIndex::new(
-            |d: &TokenInfo, k: Vec<u8>| (d.owner.clone(), k),
+        owner: MultiIndex::new(|d: &TokenInfo| d.owner.clone(),
 ```
-
-, which is the one that will take the value, and the primary key (which is always in `Vec<u8>` form) of the
-original map, and create the index key from them. Of course, this requires that the elements required
-for the index key are present in the value (which makes sense).
+which is the one that will take the value of the original map and create the index key from it.
+Of course, this requires that the elements required for the index key are present in the value.
 Besides the index function, we must also supply the namespace of the pk, and the one for the new index.
 
 ---
@@ -595,15 +596,18 @@ Notice this uses `prefix()`, explained above in the `Map` section.
     let tokens = res?;
 ```
 Now `tokens` contains `(token_id, TokenInfo)` pairs for the given `owner`.
-The pk values are `Vec<u8>`, as this is a limitation of the current implementation.
+The pk values are `Vec<u8>` in the case of `range_raw()`, but will be deserialized to the proper type using
+`range()`; provided that the pk deserialization type (`String`, in this case) is correctly specified
+in the `MultiIndex` definition (see [Index keys deserialization](#index-keys-deserialization),
+below).
 
-Another example that is similar, but returning only the `token_id`s, using the `keys()` method:
+Another example that is similar, but returning only the (raw) `token_id`s, using the `keys_raw()` method:
 ```rust
     let pks: Vec<_> = tokens()
         .idx
         .owner
         .prefix(owner_addr)
-        .keys(
+        .keys_raw(
             deps.storage,
             start,
             None,
@@ -612,22 +616,22 @@ Another example that is similar, but returning only the `token_id`s, using the `
         .take(limit)
         .collect();
 ```
-Now `pks` contains `token_id` values (as `Vec<u8>`s) for the given `owner`.
+Now `pks` contains `token_id` values (as raw `Vec<u8>`s) for the given `owner`. By using `keys` instead,
+a deserialized key can be obtained, as detailed in the next section.
 
 ### Index keys deserialization
 
-To deserialize keys of indexes (using the `*_de` functions), there are currently some requirements / limitations:
+For `UniqueIndex` and `MultiIndex`, the primary key (`PK`) type needs to be specified, in order to deserialize
+the primary key to it.
+This `PK` type specification is also important for `MultiIndex` type-safe bounds, as the primary key
+is part of the multi-index key. See next section, [Type-safe bounds over MultiIndex](#type-safe-bounds-over-multiindex).
 
-- For `UniqueIndex`: The primary key (`PK`) type needs to be specified, in order to deserialize the primary key to it.
-This generic type comes with a default of `()`, which means that no deserialization / data will be provided
-for the primary key. This is for backwards compatibility with the current `UniqueIndex` impl. It can also come handy
-in cases you don't need the primary key, and are interested only in the deserialized value.
+**NB**: This specification is still a manual (and therefore error-prone) process / setup, that will (if possible)
+be automated in the future (https://github.com/CosmWasm/cw-plus/issues/531).
 
-- For `MultiIndex`: The last element of the index tuple must be specified with the type you want it to be deserialized.
-That is, the last tuple element serves as a marker for the deserialization type (in the same way `PK` does it in
-`UniqueIndex`).
+### Type-safe bounds over MultiIndex
 
-- There are currently some inconsistencies in the values that are returned for the different index keys. `MultiIndex`
-returns a tuple with the remaining part of the index key along with the primary key, whereas `UniqueIndex` returns only
-the primary key. This will be changed in the future (See https://github.com/CosmWasm/cw-plus/issues/532) for consistency
-and compatibility with the base `Map` type behaviour.
+In the particular case of `MultiIndex`, the primary key (`PK`) type parameter also defines the type of the (partial) bounds over
+the index key (the part that corresponds to the primary key, that is).
+So, to correctly use type-safe bounds over multi-indexes ranges, it is fundamental for this `PK` type
+to be correctly defined, so that it matches the primary key type, or its (typically owned) deserialization variant.

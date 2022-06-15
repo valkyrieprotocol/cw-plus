@@ -7,20 +7,19 @@ use cosmwasm_std::{
     Response, StdResult,
 };
 
-use cw0::{maybe_addr, Expiration};
 use cw2::set_contract_version;
 use cw3::{
-    ProposalListResponse, ProposalResponse, Status, ThresholdResponse, Vote, VoteInfo,
-    VoteListResponse, VoteResponse, VoterDetail, VoterListResponse, VoterResponse,
+    ProposalListResponse, ProposalResponse, Status, Vote, VoteInfo, VoteListResponse, VoteResponse,
+    VoterDetail, VoterListResponse, VoterResponse,
 };
+use cw3_fixed_multisig::state::{next_id, Ballot, Proposal, Votes, BALLOTS, PROPOSALS};
 use cw4::{Cw4Contract, MemberChangedHookMsg, MemberDiff};
 use cw_storage_plus::Bound;
+use cw_utils::{maybe_addr, Expiration, ThresholdResponse};
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::state::{
-    next_id, parse_id, Ballot, Config, Proposal, Votes, BALLOTS, CONFIG, PROPOSALS,
-};
+use crate::state::{Config, CONFIG};
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:cw3-flex-multisig";
@@ -189,7 +188,7 @@ pub fn execute_vote(
 
 pub fn execute_execute(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     info: MessageInfo,
     proposal_id: u64,
 ) -> Result<Response, ContractError> {
@@ -198,7 +197,7 @@ pub fn execute_execute(
     let mut prop = PROPOSALS.load(deps.storage, proposal_id)?;
     // we allow execution even after the proposal "expiration" as long as all vote come in before
     // that point. If it was approved on time, it can be executed any time.
-    if prop.status != Status::Passed {
+    if prop.current_status(&env.block) != Status::Passed {
         return Err(ContractError::WrongExecuteStatus {});
     }
 
@@ -316,14 +315,14 @@ fn list_proposals(
     limit: Option<u32>,
 ) -> StdResult<ProposalListResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    let start = start_after.map(Bound::exclusive_int);
-    let props: StdResult<Vec<_>> = PROPOSALS
+    let start = start_after.map(Bound::exclusive);
+    let proposals = PROPOSALS
         .range(deps.storage, start, None, Order::Ascending)
         .take(limit)
         .map(|p| map_proposal(&env.block, p))
-        .collect();
+        .collect::<StdResult<_>>()?;
 
-    Ok(ProposalListResponse { proposals: props? })
+    Ok(ProposalListResponse { proposals })
 }
 
 fn reverse_proposals(
@@ -333,7 +332,7 @@ fn reverse_proposals(
     limit: Option<u32>,
 ) -> StdResult<ProposalListResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
-    let end = start_before.map(Bound::exclusive_int);
+    let end = start_before.map(Bound::exclusive);
     let props: StdResult<Vec<_>> = PROPOSALS
         .range(deps.storage, None, end, Order::Descending)
         .take(limit)
@@ -345,19 +344,20 @@ fn reverse_proposals(
 
 fn map_proposal(
     block: &BlockInfo,
-    item: StdResult<(Vec<u8>, Proposal)>,
+    item: StdResult<(u64, Proposal)>,
 ) -> StdResult<ProposalResponse> {
-    let (key, prop) = item?;
-    let status = prop.current_status(block);
-    let threshold = prop.threshold.to_response(prop.total_weight);
-    Ok(ProposalResponse {
-        id: parse_id(&key)?,
-        title: prop.title,
-        description: prop.description,
-        msgs: prop.msgs,
-        status,
-        expires: prop.expires,
-        threshold,
+    item.map(|(id, prop)| {
+        let status = prop.current_status(block);
+        let threshold = prop.threshold.to_response(prop.total_weight);
+        ProposalResponse {
+            id,
+            title: prop.title,
+            description: prop.description,
+            msgs: prop.msgs,
+            status,
+            expires: prop.expires,
+            threshold,
+        }
     })
 }
 
@@ -365,6 +365,7 @@ fn query_vote(deps: Deps, proposal_id: u64, voter: String) -> StdResult<VoteResp
     let voter_addr = deps.api.addr_validate(&voter)?;
     let prop = BALLOTS.may_load(deps.storage, (proposal_id, &voter_addr))?;
     let vote = prop.map(|b| VoteInfo {
+        proposal_id,
         voter,
         vote: b.vote,
         weight: b.weight,
@@ -380,23 +381,23 @@ fn list_votes(
 ) -> StdResult<VoteListResponse> {
     let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
     let addr = maybe_addr(deps.api, start_after)?;
-    let start = addr.map(|addr| Bound::exclusive(addr.as_ref()));
+    let start = addr.as_ref().map(Bound::exclusive);
 
-    let votes: StdResult<Vec<_>> = BALLOTS
+    let votes = BALLOTS
         .prefix(proposal_id)
         .range(deps.storage, start, None, Order::Ascending)
         .take(limit)
         .map(|item| {
-            let (voter, ballot) = item?;
-            Ok(VoteInfo {
-                voter: String::from_utf8(voter)?,
+            item.map(|(addr, ballot)| VoteInfo {
+                proposal_id,
+                voter: addr.into(),
                 vote: ballot.vote,
                 weight: ballot.weight,
             })
         })
-        .collect();
+        .collect::<StdResult<_>>()?;
 
-    Ok(VoteListResponse { votes: votes? })
+    Ok(VoteListResponse { votes })
 }
 
 fn query_voter(deps: Deps, voter: String) -> StdResult<VoterResponse> {
@@ -429,14 +430,13 @@ fn list_voters(
 mod tests {
     use cosmwasm_std::{coin, coins, Addr, BankMsg, Coin, Decimal, Timestamp};
 
-    use cw0::Duration;
     use cw2::{query_contract_info, ContractVersion};
     use cw4::{Cw4ExecuteMsg, Member};
     use cw4_group::helpers::Cw4GroupContract;
     use cw_multi_test::{next_block, App, AppBuilder, Contract, ContractWrapper, Executor};
+    use cw_utils::{Duration, Threshold};
 
     use super::*;
-    use crate::msg::Threshold;
 
     const OWNER: &str = "admin0001";
     const VOTER1: &str = "voter0001";
@@ -627,7 +627,10 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert_eq!(ContractError::InvalidThreshold {}, err.downcast().unwrap());
+        assert_eq!(
+            ContractError::Threshold(cw_utils::ThresholdError::InvalidThreshold {}),
+            err.downcast().unwrap()
+        );
 
         // Total weight less than required weight not allowed
         let instantiate_msg = InstantiateMsg {
@@ -645,7 +648,10 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert_eq!(ContractError::UnreachableWeight {}, err.downcast().unwrap());
+        assert_eq!(
+            ContractError::Threshold(cw_utils::ThresholdError::UnreachableWeight {}),
+            err.downcast().unwrap()
+        );
 
         // All valid
         let instantiate_msg = InstantiateMsg {
@@ -1020,6 +1026,7 @@ mod tests {
         assert_eq!(
             vote.vote.unwrap(),
             VoteInfo {
+                proposal_id,
                 voter: OWNER.into(),
                 vote: Vote::Yes,
                 weight: 0
@@ -1035,6 +1042,7 @@ mod tests {
         assert_eq!(
             vote.vote.unwrap(),
             VoteInfo {
+                proposal_id,
                 voter: VOTER2.into(),
                 vote: Vote::No,
                 weight: 2
@@ -1048,6 +1056,39 @@ mod tests {
             .query_wasm_smart(&flex_addr, &QueryMsg::Vote { proposal_id, voter })
             .unwrap();
         assert!(vote.vote.is_none());
+
+        // create proposal with 0 vote power
+        let proposal = pay_somebody_proposal();
+        let res = app
+            .execute_contract(Addr::unchecked(OWNER), flex_addr.clone(), &proposal, &[])
+            .unwrap();
+
+        // Get the proposal id from the logs
+        let proposal_id: u64 = res.custom_attrs(1)[2].value.parse().unwrap();
+
+        // Cast a No vote
+        let no_vote = ExecuteMsg::Vote {
+            proposal_id,
+            vote: Vote::No,
+        };
+        let _ = app
+            .execute_contract(Addr::unchecked(VOTER2), flex_addr.clone(), &no_vote, &[])
+            .unwrap();
+
+        // Powerful voter opposes it, so it rejects
+        let res = app
+            .execute_contract(Addr::unchecked(VOTER4), flex_addr, &no_vote, &[])
+            .unwrap();
+
+        assert_eq!(
+            res.custom_attrs(1),
+            [
+                ("action", "vote"),
+                ("sender", VOTER4),
+                ("proposal_id", proposal_id.to_string().as_str()),
+                ("status", "Rejected"),
+            ],
+        );
     }
 
     #[test]
@@ -1136,9 +1177,99 @@ mod tests {
 
         // In passing: Try to close Executed fails
         let err = app
-            .execute_contract(Addr::unchecked(OWNER), flex_addr, &closing, &[])
+            .execute_contract(Addr::unchecked(OWNER), flex_addr.clone(), &closing, &[])
             .unwrap_err();
         assert_eq!(ContractError::WrongCloseStatus {}, err.downcast().unwrap());
+
+        // Trying to execute something that was already executed fails
+        let err = app
+            .execute_contract(Addr::unchecked(SOMEBODY), flex_addr, &execution, &[])
+            .unwrap_err();
+        assert_eq!(
+            ContractError::WrongExecuteStatus {},
+            err.downcast().unwrap()
+        );
+    }
+
+    #[test]
+    fn proposal_pass_on_expiration() {
+        let init_funds = coins(10, "BTC");
+        let mut app = mock_app(&init_funds);
+
+        let threshold = Threshold::ThresholdQuorum {
+            threshold: Decimal::percent(51),
+            quorum: Decimal::percent(1),
+        };
+        let voting_period = 2000000;
+        let (flex_addr, _) = setup_test_case(
+            &mut app,
+            threshold,
+            Duration::Time(voting_period),
+            init_funds,
+            true,
+        );
+
+        // ensure we have cash to cover the proposal
+        let contract_bal = app.wrap().query_balance(&flex_addr, "BTC").unwrap();
+        assert_eq!(contract_bal, coin(10, "BTC"));
+
+        // create proposal with 0 vote power
+        let proposal = pay_somebody_proposal();
+        let res = app
+            .execute_contract(Addr::unchecked(OWNER), flex_addr.clone(), &proposal, &[])
+            .unwrap();
+
+        // Get the proposal id from the logs
+        let proposal_id: u64 = res.custom_attrs(1)[2].value.parse().unwrap();
+
+        // Vote it, so it passes after voting period is over
+        let vote = ExecuteMsg::Vote {
+            proposal_id,
+            vote: Vote::Yes,
+        };
+        let res = app
+            .execute_contract(Addr::unchecked(VOTER3), flex_addr.clone(), &vote, &[])
+            .unwrap();
+        assert_eq!(
+            res.custom_attrs(1),
+            [
+                ("action", "vote"),
+                ("sender", VOTER3),
+                ("proposal_id", proposal_id.to_string().as_str()),
+                ("status", "Open"),
+            ],
+        );
+
+        // Wait until the voting period is over.
+        app.update_block(|block| {
+            block.time = block.time.plus_seconds(voting_period);
+            block.height += std::cmp::max(1, voting_period / 5);
+        });
+
+        // Proposal should now be passed.
+        let prop: ProposalResponse = app
+            .wrap()
+            .query_wasm_smart(&flex_addr, &QueryMsg::Proposal { proposal_id })
+            .unwrap();
+        assert_eq!(prop.status, Status::Passed);
+
+        // Execution should now be possible.
+        let res = app
+            .execute_contract(
+                Addr::unchecked(SOMEBODY),
+                flex_addr,
+                &ExecuteMsg::Execute { proposal_id },
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            res.custom_attrs(1),
+            [
+                ("action", "execute"),
+                ("sender", SOMEBODY),
+                ("proposal_id", proposal_id.to_string().as_str()),
+            ],
+        );
     }
 
     #[test]

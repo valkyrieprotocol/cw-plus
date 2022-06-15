@@ -1,6 +1,7 @@
 // this module requires iterator to be useful at all
 #![cfg(feature = "iterator")]
 
+use crate::PrefixBound;
 use cosmwasm_std::{StdError, StdResult, Storage};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -10,15 +11,15 @@ use crate::indexes::Index;
 use crate::iter_helpers::{deserialize_kv, deserialize_v};
 use crate::keys::{Prefixer, PrimaryKey};
 use crate::map::Map;
-use crate::prefix::{namespaced_prefix_range, Bound, Prefix, PrefixBound};
-use crate::Path;
+use crate::prefix::{namespaced_prefix_range, Prefix};
+use crate::{Bound, Path};
 
 pub trait IndexList<T> {
     fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<T>> + '_>;
 }
 
 // TODO: remove traits here and make this const fn new
-/// IndexedBucket works like a bucket but has a secondary index
+/// `IndexedMap` works like a `Map` but has a secondary index
 pub struct IndexedMap<'a, K, T, I>
 where
     K: PrimaryKey<'a>,
@@ -129,42 +130,14 @@ where
         self.primary.may_load(store, key)
     }
 
-    // use prefix to scan -> range
-    pub fn prefix(&self, p: K::Prefix) -> Prefix<Vec<u8>, T> {
-        Prefix::new(self.pk_namespace, &p.prefix())
-    }
-
-    // use sub_prefix to scan -> range
-    pub fn sub_prefix(&self, p: K::SubPrefix) -> Prefix<Vec<u8>, T> {
-        Prefix::new(self.pk_namespace, &p.prefix())
+    /// Returns true if storage contains this key, without parsing or interpreting the contents.
+    pub fn has(&self, store: &dyn Storage, k: K) -> bool {
+        self.primary.key(k).has(store)
     }
 
     // use no_prefix to scan -> range
-    fn no_prefix(&self) -> Prefix<Vec<u8>, T> {
+    fn no_prefix_raw(&self) -> Prefix<Vec<u8>, T, K> {
         Prefix::new(self.pk_namespace, &[])
-    }
-}
-
-// short-cut for simple keys, rather than .prefix(()).range(...)
-impl<'a, K, T, I> IndexedMap<'a, K, T, I>
-where
-    K: PrimaryKey<'a>,
-    T: Serialize + DeserializeOwned + Clone,
-    I: IndexList<T>,
-{
-    // I would prefer not to copy code from Prefix, but no other way
-    // with lifetimes (create Prefix inside function and return ref = no no)
-    pub fn range<'c>(
-        &self,
-        store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
-        order: cosmwasm_std::Order,
-    ) -> Box<dyn Iterator<Item = StdResult<cosmwasm_std::Record<T>>> + 'c>
-    where
-        T: 'c,
-    {
-        self.no_prefix().range(store, min, max, order)
     }
 }
 
@@ -175,12 +148,12 @@ where
     T: Serialize + DeserializeOwned + Clone,
     I: IndexList<T>,
 {
-    /// While `range` over a `prefix` fixes the prefix to one element and iterates over the
-    /// remaining, `prefix_range` accepts bounds for the lowest and highest elements of the `Prefix`
+    /// While `range_raw` over a `prefix` fixes the prefix to one element and iterates over the
+    /// remaining, `prefix_range_raw` accepts bounds for the lowest and highest elements of the `Prefix`
     /// itself, and iterates over those (inclusively or exclusively, depending on `PrefixBound`).
     /// There are some issues that distinguish these two, and blindly casting to `Vec<u8>` doesn't
     /// solve them.
-    pub fn prefix_range<'c>(
+    pub fn prefix_range_raw<'c>(
         &self,
         store: &'c dyn Storage,
         min: Option<PrefixBound<'a, K::Prefix>>,
@@ -204,11 +177,11 @@ where
     K: PrimaryKey<'a>,
     I: IndexList<T>,
 {
-    pub fn sub_prefix_de(&self, p: K::SubPrefix) -> Prefix<K::SuperSuffix, T> {
+    pub fn sub_prefix(&self, p: K::SubPrefix) -> Prefix<K::SuperSuffix, T, K::SuperSuffix> {
         Prefix::new(self.pk_namespace, &p.prefix())
     }
 
-    pub fn prefix_de(&self, p: K::Prefix) -> Prefix<K::Suffix, T> {
+    pub fn prefix(&self, p: K::Prefix) -> Prefix<K::Suffix, T, K::Suffix> {
         Prefix::new(self.pk_namespace, &p.prefix())
     }
 }
@@ -220,13 +193,13 @@ where
     K: PrimaryKey<'a> + KeyDeserialize,
     I: IndexList<T>,
 {
-    /// While `range_de` over a `prefix_de` fixes the prefix to one element and iterates over the
-    /// remaining, `prefix_range_de` accepts bounds for the lowest and highest elements of the
+    /// While `range` over a `prefix` fixes the prefix to one element and iterates over the
+    /// remaining, `prefix_range` accepts bounds for the lowest and highest elements of the
     /// `Prefix` itself, and iterates over those (inclusively or exclusively, depending on
     /// `PrefixBound`).
     /// There are some issues that distinguish these two, and blindly casting to `Vec<u8>` doesn't
     /// solve them.
-    pub fn prefix_range_de<'c>(
+    pub fn prefix_range<'c>(
         &self,
         store: &'c dyn Storage,
         min: Option<PrefixBound<'a, K::Prefix>>,
@@ -244,35 +217,58 @@ where
         Box::new(mapped)
     }
 
-    pub fn range_de<'c>(
+    pub fn range_raw<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
+        order: cosmwasm_std::Order,
+    ) -> Box<dyn Iterator<Item = StdResult<cosmwasm_std::Record<T>>> + 'c>
+    where
+        T: 'c,
+    {
+        self.no_prefix_raw().range_raw(store, min, max, order)
+    }
+
+    pub fn keys_raw<'c>(
+        &self,
+        store: &'c dyn Storage,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
+        order: cosmwasm_std::Order,
+    ) -> Box<dyn Iterator<Item = Vec<u8>> + 'c> {
+        self.no_prefix_raw().keys_raw(store, min, max, order)
+    }
+
+    pub fn range<'c>(
+        &self,
+        store: &'c dyn Storage,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<(K::Output, T)>> + 'c>
     where
         T: 'c,
         K::Output: 'static,
     {
-        self.no_prefix_de().range_de(store, min, max, order)
+        self.no_prefix().range(store, min, max, order)
     }
 
-    pub fn keys_de<'c>(
+    pub fn keys<'c>(
         &self,
         store: &'c dyn Storage,
-        min: Option<Bound>,
-        max: Option<Bound>,
+        min: Option<Bound<'a, K>>,
+        max: Option<Bound<'a, K>>,
         order: cosmwasm_std::Order,
     ) -> Box<dyn Iterator<Item = StdResult<K::Output>> + 'c>
     where
         T: 'c,
         K::Output: 'static,
     {
-        self.no_prefix_de().keys_de(store, min, max, order)
+        self.no_prefix().keys(store, min, max, order)
     }
 
-    fn no_prefix_de(&self) -> Prefix<K, T> {
+    fn no_prefix(&self) -> Prefix<K, T, K> {
         Prefix::new(self.pk_namespace, &[])
     }
 }
@@ -281,8 +277,8 @@ where
 mod test {
     use super::*;
 
-    use crate::indexes::{index_string_tuple, index_triple};
-    use crate::{MultiIndex, UniqueIndex};
+    use crate::indexes::index_string_tuple;
+    use crate::{index_tuple, MultiIndex, UniqueIndex};
     use cosmwasm_std::testing::MockStorage;
     use cosmwasm_std::{MemoryStorage, Order};
     use serde::{Deserialize, Serialize};
@@ -295,8 +291,8 @@ mod test {
     }
 
     struct DataIndexes<'a> {
-        // Second arg is for storing pk
-        pub name: MultiIndex<'a, (String, String), Data>,
+        // Last type parameters are for signaling pk deserialization
+        pub name: MultiIndex<'a, String, Data, String>,
         pub age: UniqueIndex<'a, u32, Data, String>,
         pub name_lastname: UniqueIndex<'a, (Vec<u8>, Vec<u8>), Data, String>,
     }
@@ -311,8 +307,8 @@ mod test {
 
     // For composite multi index tests
     struct DataCompositeMultiIndex<'a> {
-        // Third arg needed for storing pk
-        pub name_age: MultiIndex<'a, (Vec<u8>, u32, Vec<u8>), Data>,
+        // Last type parameter is for signaling pk deserialization
+        pub name_age: MultiIndex<'a, (Vec<u8>, u32), Data, String>,
     }
 
     // Future Note: this can likely be macro-derived
@@ -326,11 +322,7 @@ mod test {
     // Can we make it easier to define this? (less wordy generic)
     fn build_map<'a>() -> IndexedMap<'a, &'a str, Data, DataIndexes<'a>> {
         let indexes = DataIndexes {
-            name: MultiIndex::new(
-                |d, k| (d.name.clone(), unsafe { String::from_utf8_unchecked(k) }),
-                "data",
-                "data__name",
-            ),
+            name: MultiIndex::new(|d| d.name.clone(), "data", "data__name"),
             age: UniqueIndex::new(|d| d.age, "data__age"),
             name_lastname: UniqueIndex::new(
                 |d| index_string_tuple(&d.name, &d.last_name),
@@ -419,19 +411,16 @@ mod test {
             .idx
             .name
             .prefix("Maria".to_string())
-            .range(&store, None, None, Order::Ascending)
+            .range_raw(&store, None, None, Order::Ascending)
             .count();
         assert_eq!(2, count);
 
-        // TODO: we load by wrong keys - get full storage key!
-
-        // load it by secondary index (we must know how to compute this)
-        // let marias: Vec<_>> = map
+        // load it by secondary index
         let marias: Vec<_> = map
             .idx
             .name
             .prefix("Maria".to_string())
-            .range(&store, None, None, Order::Ascending)
+            .range_raw(&store, None, None, Order::Ascending)
             .collect::<StdResult<_>>()
             .unwrap();
         assert_eq!(2, marias.len());
@@ -444,7 +433,7 @@ mod test {
             .idx
             .name
             .prefix("Marib".to_string())
-            .range(&store, None, None, Order::Ascending)
+            .range_raw(&store, None, None, Order::Ascending)
             .count();
         assert_eq!(0, count);
 
@@ -453,7 +442,7 @@ mod test {
             .idx
             .name
             .prefix("Mari`".to_string())
-            .range(&store, None, None, Order::Ascending)
+            .range_raw(&store, None, None, Order::Ascending)
             .count();
         assert_eq!(0, count);
 
@@ -462,49 +451,58 @@ mod test {
             .idx
             .name
             .prefix("Maria5".to_string())
-            .range(&store, None, None, Order::Ascending)
+            .range_raw(&store, None, None, Order::Ascending)
             .count();
         assert_eq!(0, count);
 
-        // index_key() over MultiIndex works (empty pk)
-        // In a MultiIndex, an index key is composed by the index and the primary key.
+        // In a MultiIndex, the index key is composed by the index and the primary key.
         // Primary key may be empty (so that to iterate over all elements that match just the index)
         let key = ("Maria".to_string(), "".to_string());
-        // Use the index_key() helper to build the (raw) index key
-        let key = map.idx.name.index_key(key);
-        // Iterate using a bound over the raw key
-        let count = map
+        // Iterate using an inclusive bound over the key
+        let marias = map
             .idx
             .name
-            .range(&store, Some(Bound::inclusive(key)), None, Order::Ascending)
-            .count();
+            .range_raw(&store, Some(Bound::inclusive(key)), None, Order::Ascending)
+            .collect::<StdResult<Vec<_>>>()
+            .unwrap();
         // gets from the first "Maria" until the end
-        assert_eq!(4, count);
+        assert_eq!(4, marias.len());
 
-        // index_key() over MultiIndex works (non-empty pk)
+        // This is equivalent to using prefix_range
+        let key = "Maria".to_string();
+        let marias2 = map
+            .idx
+            .name
+            .prefix_range_raw(
+                &store,
+                Some(PrefixBound::inclusive(key)),
+                None,
+                Order::Ascending,
+            )
+            .collect::<StdResult<Vec<_>>>()
+            .unwrap();
+        assert_eq!(4, marias2.len());
+        assert_eq!(marias, marias2);
+
         // Build key including a non-empty pk
         let key = ("Maria".to_string(), "1".to_string());
-        // Use the index_key() helper to build the (raw) index key
-        let key = map.idx.name.index_key(key);
-        // Iterate using a (exclusive) bound over the raw key.
+        // Iterate using a (exclusive) bound over the key.
         // (Useful for pagination / continuation contexts).
         let count = map
             .idx
             .name
-            .range(&store, Some(Bound::exclusive(key)), None, Order::Ascending)
+            .range_raw(&store, Some(Bound::exclusive(key)), None, Order::Ascending)
             .count();
         // gets from the 2nd "Maria" until the end
         assert_eq!(3, count);
 
         // index_key() over UniqueIndex works.
         let age_key = 23u32;
-        // Use the index_key() helper to build the (raw) index key
-        let age_key = map.idx.age.index_key(age_key);
-        // Iterate using a (inclusive) bound over the raw key.
+        // Iterate using a (inclusive) bound over the key.
         let count = map
             .idx
             .age
-            .range(
+            .range_raw(
                 &store,
                 Some(Bound::inclusive(age_key)),
                 None,
@@ -524,6 +522,72 @@ mod test {
         let too_old = 43u32;
         let aged = map.idx.age.item(&store, too_old).unwrap();
         assert_eq!(None, aged);
+    }
+
+    #[test]
+    fn existence() {
+        let mut store = MockStorage::new();
+        let map = build_map();
+        let (pks, _) = save_data(&mut store, &map);
+
+        assert!(map.has(&store, pks[0]));
+        assert!(!map.has(&store, "6"));
+    }
+
+    #[test]
+    fn range_raw_simple_key_by_multi_index() {
+        let mut store = MockStorage::new();
+        let map = build_map();
+
+        // save data
+        let data1 = Data {
+            name: "Maria".to_string(),
+            last_name: "".to_string(),
+            age: 42,
+        };
+        let pk = "5627";
+        map.save(&mut store, pk, &data1).unwrap();
+
+        let data2 = Data {
+            name: "Juan".to_string(),
+            last_name: "Perez".to_string(),
+            age: 13,
+        };
+        let pk = "5628";
+        map.save(&mut store, pk, &data2).unwrap();
+
+        let data3 = Data {
+            name: "Maria".to_string(),
+            last_name: "Williams".to_string(),
+            age: 24,
+        };
+        let pk = "5629";
+        map.save(&mut store, pk, &data3).unwrap();
+
+        let data4 = Data {
+            name: "Maria Luisa".to_string(),
+            last_name: "Bemberg".to_string(),
+            age: 12,
+        };
+        let pk = "5630";
+        map.save(&mut store, pk, &data4).unwrap();
+
+        let marias: Vec<_> = map
+            .idx
+            .name
+            .prefix("Maria".to_string())
+            .range_raw(&store, None, None, Order::Descending)
+            .collect::<StdResult<_>>()
+            .unwrap();
+        let count = marias.len();
+        assert_eq!(2, count);
+
+        // Pks, sorted by (descending) pk
+        assert_eq!(marias[0].0, b"5629");
+        assert_eq!(marias[1].0, b"5627");
+        // Data is correct
+        assert_eq!(marias[0].1, data3);
+        assert_eq!(marias[1].1, data1);
     }
 
     #[test]
@@ -574,63 +638,7 @@ mod test {
         let count = marias.len();
         assert_eq!(2, count);
 
-        // Sorted by (descending) pk
-        assert_eq!(marias[0].0, b"5629");
-        assert_eq!(marias[1].0, b"5627");
-        // Data is correct
-        assert_eq!(marias[0].1, data3);
-        assert_eq!(marias[1].1, data1);
-    }
-
-    #[test]
-    fn range_de_simple_key_by_multi_index() {
-        let mut store = MockStorage::new();
-        let map = build_map();
-
-        // save data
-        let data1 = Data {
-            name: "Maria".to_string(),
-            last_name: "".to_string(),
-            age: 42,
-        };
-        let pk = "5627";
-        map.save(&mut store, pk, &data1).unwrap();
-
-        let data2 = Data {
-            name: "Juan".to_string(),
-            last_name: "Perez".to_string(),
-            age: 13,
-        };
-        let pk = "5628";
-        map.save(&mut store, pk, &data2).unwrap();
-
-        let data3 = Data {
-            name: "Maria".to_string(),
-            last_name: "Williams".to_string(),
-            age: 24,
-        };
-        let pk = "5629";
-        map.save(&mut store, pk, &data3).unwrap();
-
-        let data4 = Data {
-            name: "Maria Luisa".to_string(),
-            last_name: "Bemberg".to_string(),
-            age: 12,
-        };
-        let pk = "5630";
-        map.save(&mut store, pk, &data4).unwrap();
-
-        let marias: Vec<_> = map
-            .idx
-            .name
-            .prefix_de("Maria".to_string())
-            .range_de(&store, None, None, Order::Descending)
-            .collect::<StdResult<_>>()
-            .unwrap();
-        let count = marias.len();
-        assert_eq!(2, count);
-
-        // Sorted by (descending) pk
+        // Pks, sorted by (descending) pk
         assert_eq!(marias[0].0, "5629");
         assert_eq!(marias[1].0, "5627");
         // Data is correct
@@ -639,15 +647,11 @@ mod test {
     }
 
     #[test]
-    fn range_composite_key_by_multi_index() {
+    fn range_raw_composite_key_by_multi_index() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -688,13 +692,13 @@ mod test {
             .idx
             .name_age
             .sub_prefix(b"Maria".to_vec())
-            .range(&store, None, None, Order::Descending)
+            .range_raw(&store, None, None, Order::Descending)
             .collect::<StdResult<_>>()
             .unwrap();
         let count = marias.len();
         assert_eq!(2, count);
 
-        // Pks (sorted by age descending)
+        // Pks, sorted by (descending) age
         assert_eq!(pk1, marias[0].0);
         assert_eq!(pk3, marias[1].0);
 
@@ -704,15 +708,11 @@ mod test {
     }
 
     #[test]
-    fn range_de_composite_key_by_multi_index() {
+    fn range_composite_key_by_multi_index() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -722,7 +722,7 @@ mod test {
             last_name: "".to_string(),
             age: 42,
         };
-        let pk1: &[u8] = b"5627";
+        let pk1 = "5627";
         map.save(&mut store, pk1, &data1).unwrap();
 
         let data2 = Data {
@@ -730,7 +730,7 @@ mod test {
             last_name: "Perez".to_string(),
             age: 13,
         };
-        let pk2: &[u8] = b"5628";
+        let pk2 = "5628";
         map.save(&mut store, pk2, &data2).unwrap();
 
         let data3 = Data {
@@ -738,7 +738,7 @@ mod test {
             last_name: "Young".to_string(),
             age: 24,
         };
-        let pk3: &[u8] = b"5629";
+        let pk3 = "5629";
         map.save(&mut store, pk3, &data3).unwrap();
 
         let data4 = Data {
@@ -746,22 +746,22 @@ mod test {
             last_name: "Bemberg".to_string(),
             age: 43,
         };
-        let pk4: &[u8] = b"5630";
+        let pk4 = "5630";
         map.save(&mut store, pk4, &data4).unwrap();
 
         let marias: Vec<_> = map
             .idx
             .name_age
-            .sub_prefix_de(b"Maria".to_vec())
-            .range_de(&store, None, None, Order::Descending)
+            .sub_prefix(b"Maria".to_vec())
+            .range(&store, None, None, Order::Descending)
             .collect::<StdResult<_>>()
             .unwrap();
         let count = marias.len();
         assert_eq!(2, count);
 
-        // Remaining part (age) of the index keys, plus pks (bytes) (sorted by age descending)
-        assert_eq!((42, pk1.to_vec()), marias[0].0);
-        assert_eq!((24, pk3.to_vec()), marias[1].0);
+        // Pks, sorted by (descending) age
+        assert_eq!(pk1, marias[0].0);
+        assert_eq!(pk3, marias[1].0);
 
         // Data
         assert_eq!(data1, marias[0].1);
@@ -843,7 +843,7 @@ mod test {
             map.idx
                 .name
                 .prefix(name.to_string())
-                .keys(store, None, None, Order::Ascending)
+                .keys_raw(store, None, None, Order::Ascending)
                 .count()
         };
 
@@ -876,6 +876,39 @@ mod test {
     }
 
     #[test]
+    fn range_raw_simple_key_by_unique_index() {
+        let mut store = MockStorage::new();
+        let map = build_map();
+
+        // save data
+        let (pks, datas) = save_data(&mut store, &map);
+
+        let res: StdResult<Vec<_>> = map
+            .idx
+            .age
+            .range_raw(&store, None, None, Order::Ascending)
+            .collect();
+        let ages = res.unwrap();
+
+        let count = ages.len();
+        assert_eq!(5, count);
+
+        // The pks, sorted by age ascending
+        assert_eq!(pks[3], String::from_slice(&ages[0].0).unwrap()); // 12
+        assert_eq!(pks[1], String::from_slice(&ages[1].0).unwrap()); // 23
+        assert_eq!(pks[2], String::from_slice(&ages[2].0).unwrap()); // 32
+        assert_eq!(pks[0], String::from_slice(&ages[3].0).unwrap()); // 42
+        assert_eq!(pks[4], String::from_slice(&ages[4].0).unwrap()); // 90
+
+        // The associated data
+        assert_eq!(datas[3], ages[0].1);
+        assert_eq!(datas[1], ages[1].1);
+        assert_eq!(datas[2], ages[2].1);
+        assert_eq!(datas[0], ages[3].1);
+        assert_eq!(datas[4], ages[4].1);
+    }
+
+    #[test]
     fn range_simple_key_by_unique_index() {
         let mut store = MockStorage::new();
         let map = build_map();
@@ -894,22 +927,22 @@ mod test {
         assert_eq!(5, count);
 
         // The pks, sorted by age ascending
-        assert_eq!(pks[4], String::from_slice(&ages[4].0).unwrap());
-        assert_eq!(pks[3], String::from_slice(&ages[0].0).unwrap());
-        assert_eq!(pks[1], String::from_slice(&ages[1].0).unwrap());
-        assert_eq!(pks[2], String::from_slice(&ages[2].0).unwrap());
-        assert_eq!(pks[0], String::from_slice(&ages[3].0).unwrap());
+        assert_eq!(pks[3], ages[0].0);
+        assert_eq!(pks[1], ages[1].0);
+        assert_eq!(pks[2], ages[2].0);
+        assert_eq!(pks[0], ages[3].0);
+        assert_eq!(pks[4], ages[4].0);
 
         // The associated data
-        assert_eq!(datas[4], ages[4].1);
         assert_eq!(datas[3], ages[0].1);
         assert_eq!(datas[1], ages[1].1);
         assert_eq!(datas[2], ages[2].1);
         assert_eq!(datas[0], ages[3].1);
+        assert_eq!(datas[4], ages[4].1);
     }
 
     #[test]
-    fn range_de_simple_key_by_unique_index() {
+    fn range_raw_composite_key_by_unique_index() {
         let mut store = MockStorage::new();
         let map = build_map();
 
@@ -918,27 +951,23 @@ mod test {
 
         let res: StdResult<Vec<_>> = map
             .idx
-            .age
-            .range_de(&store, None, None, Order::Ascending)
+            .name_lastname
+            .prefix(b"Maria".to_vec())
+            .range_raw(&store, None, None, Order::Ascending)
             .collect();
-        let ages = res.unwrap();
+        let marias = res.unwrap();
 
-        let count = ages.len();
-        assert_eq!(5, count);
+        // Only two people are called "Maria"
+        let count = marias.len();
+        assert_eq!(2, count);
 
-        // The pks, sorted by age ascending
-        assert_eq!(pks[4], ages[4].0);
-        assert_eq!(pks[3], ages[0].0);
-        assert_eq!(pks[1], ages[1].0);
-        assert_eq!(pks[2], ages[2].0);
-        assert_eq!(pks[0], ages[3].0);
+        // The pks
+        assert_eq!(pks[0], String::from_slice(&marias[0].0).unwrap());
+        assert_eq!(pks[1], String::from_slice(&marias[1].0).unwrap());
 
         // The associated data
-        assert_eq!(datas[4], ages[4].1);
-        assert_eq!(datas[3], ages[0].1);
-        assert_eq!(datas[1], ages[1].1);
-        assert_eq!(datas[2], ages[2].1);
-        assert_eq!(datas[0], ages[3].1);
+        assert_eq!(datas[0], marias[0].1);
+        assert_eq!(datas[1], marias[1].1);
     }
 
     #[test]
@@ -962,35 +991,6 @@ mod test {
         assert_eq!(2, count);
 
         // The pks
-        assert_eq!(pks[0], String::from_slice(&marias[0].0).unwrap());
-        assert_eq!(pks[1], String::from_slice(&marias[1].0).unwrap());
-
-        // The associated data
-        assert_eq!(datas[0], marias[0].1);
-        assert_eq!(datas[1], marias[1].1);
-    }
-
-    #[test]
-    fn range_de_composite_key_by_unique_index() {
-        let mut store = MockStorage::new();
-        let map = build_map();
-
-        // save data
-        let (pks, datas) = save_data(&mut store, &map);
-
-        let res: StdResult<Vec<_>> = map
-            .idx
-            .name_lastname
-            .prefix_de(b"Maria".to_vec())
-            .range_de(&store, None, None, Order::Ascending)
-            .collect();
-        let marias = res.unwrap();
-
-        // Only two people are called "Maria"
-        let count = marias.len();
-        assert_eq!(2, count);
-
-        // The pks
         assert_eq!(pks[0], marias[0].0);
         assert_eq!(pks[1], marias[1].0);
 
@@ -1001,7 +1001,7 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn range_de_simple_string_key() {
+    fn range_simple_string_key() {
         let mut store = MockStorage::new();
         let map = build_map();
 
@@ -1009,7 +1009,7 @@ mod test {
         let (pks, datas) = save_data(&mut store, &map);
 
         // let's try to iterate!
-        let all: StdResult<Vec<_>> = map.range_de(&store, None, None, Order::Ascending).collect();
+        let all: StdResult<Vec<_>> = map.range(&store, None, None, Order::Ascending).collect();
         let all = all.unwrap();
         assert_eq!(
             all,
@@ -1022,12 +1022,7 @@ mod test {
 
         // let's try to iterate over a range
         let all: StdResult<Vec<_>> = map
-            .range_de(
-                &store,
-                Some(Bound::Inclusive(b"3".to_vec())),
-                None,
-                Order::Ascending,
-            )
+            .range(&store, Some(Bound::inclusive("3")), None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(
@@ -1044,7 +1039,7 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_de_simple_string_key() {
+    fn prefix_simple_string_key() {
         let mut store = MockStorage::new();
         let map = build_map();
 
@@ -1052,11 +1047,11 @@ mod test {
         let (pks, datas) = save_data(&mut store, &map);
 
         // Let's prefix and iterate.
-        // This is similar to calling range() directly, but added here for completeness / prefix_de
+        // This is similar to calling range() directly, but added here for completeness / prefix
         // type checks
         let all: StdResult<Vec<_>> = map
-            .prefix_de(())
-            .range_de(&store, None, None, Order::Ascending)
+            .prefix(())
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let all = all.unwrap();
         assert_eq!(
@@ -1071,15 +1066,11 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_de_composite_key() {
+    fn prefix_composite_key() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -1089,7 +1080,7 @@ mod test {
             last_name: "".to_string(),
             age: 42,
         };
-        let pk1: (&str, &str) = ("1", "5627");
+        let pk1 = ("1", "5627");
         map.save(&mut store, pk1, &data1).unwrap();
 
         let data2 = Data {
@@ -1097,7 +1088,7 @@ mod test {
             last_name: "Perez".to_string(),
             age: 13,
         };
-        let pk2: (&str, &str) = ("2", "5628");
+        let pk2 = ("2", "5628");
         map.save(&mut store, pk2, &data2).unwrap();
 
         let data3 = Data {
@@ -1105,7 +1096,7 @@ mod test {
             last_name: "Young".to_string(),
             age: 24,
         };
-        let pk3: (&str, &str) = ("2", "5629");
+        let pk3 = ("2", "5629");
         map.save(&mut store, pk3, &data3).unwrap();
 
         let data4 = Data {
@@ -1113,13 +1104,13 @@ mod test {
             last_name: "Bemberg".to_string(),
             age: 43,
         };
-        let pk4: (&str, &str) = ("3", "5630");
+        let pk4 = ("3", "5630");
         map.save(&mut store, pk4, &data4).unwrap();
 
         // let's prefix and iterate
         let result: StdResult<Vec<_>> = map
-            .prefix_de("2")
-            .range_de(&store, None, None, Order::Ascending)
+            .prefix("2")
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let result = result.unwrap();
         assert_eq!(
@@ -1130,15 +1121,11 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_de_triple_key() {
+    fn prefix_triple_key() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -1148,7 +1135,7 @@ mod test {
             last_name: "".to_string(),
             age: 42,
         };
-        let pk1: (&str, &str, &str) = ("1", "1", "5627");
+        let pk1 = ("1", "1", "5627");
         map.save(&mut store, pk1, &data1).unwrap();
 
         let data2 = Data {
@@ -1156,7 +1143,7 @@ mod test {
             last_name: "Perez".to_string(),
             age: 13,
         };
-        let pk2: (&str, &str, &str) = ("1", "2", "5628");
+        let pk2 = ("1", "2", "5628");
         map.save(&mut store, pk2, &data2).unwrap();
 
         let data3 = Data {
@@ -1164,7 +1151,7 @@ mod test {
             last_name: "Young".to_string(),
             age: 24,
         };
-        let pk3: (&str, &str, &str) = ("2", "1", "5629");
+        let pk3 = ("2", "1", "5629");
         map.save(&mut store, pk3, &data3).unwrap();
 
         let data4 = Data {
@@ -1172,13 +1159,13 @@ mod test {
             last_name: "Bemberg".to_string(),
             age: 43,
         };
-        let pk4: (&str, &str, &str) = ("2", "2", "5630");
+        let pk4 = ("2", "2", "5630");
         map.save(&mut store, pk4, &data4).unwrap();
 
         // let's prefix and iterate
         let result: StdResult<Vec<_>> = map
-            .prefix_de(("1", "2"))
-            .range_de(&store, None, None, Order::Ascending)
+            .prefix(("1", "2"))
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let result = result.unwrap();
         assert_eq!(result, [("5628".to_string(), data2),]);
@@ -1186,15 +1173,11 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn sub_prefix_de_triple_key() {
+    fn sub_prefix_triple_key() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -1204,7 +1187,7 @@ mod test {
             last_name: "".to_string(),
             age: 42,
         };
-        let pk1: (&str, &str, &str) = ("1", "1", "5627");
+        let pk1 = ("1", "1", "5627");
         map.save(&mut store, pk1, &data1).unwrap();
 
         let data2 = Data {
@@ -1212,7 +1195,7 @@ mod test {
             last_name: "Perez".to_string(),
             age: 13,
         };
-        let pk2: (&str, &str, &str) = ("1", "2", "5628");
+        let pk2 = ("1", "2", "5628");
         map.save(&mut store, pk2, &data2).unwrap();
 
         let data3 = Data {
@@ -1220,7 +1203,7 @@ mod test {
             last_name: "Young".to_string(),
             age: 24,
         };
-        let pk3: (&str, &str, &str) = ("2", "1", "5629");
+        let pk3 = ("2", "1", "5629");
         map.save(&mut store, pk3, &data3).unwrap();
 
         let data4 = Data {
@@ -1228,13 +1211,13 @@ mod test {
             last_name: "Bemberg".to_string(),
             age: 43,
         };
-        let pk4: (&str, &str, &str) = ("2", "2", "5630");
+        let pk4 = ("2", "2", "5630");
         map.save(&mut store, pk4, &data4).unwrap();
 
         // let's sub-prefix and iterate
         let result: StdResult<Vec<_>> = map
-            .sub_prefix_de("1")
-            .range_de(&store, None, None, Order::Ascending)
+            .sub_prefix("1")
+            .range(&store, None, None, Order::Ascending)
             .collect();
         let result = result.unwrap();
         assert_eq!(
@@ -1248,15 +1231,11 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_range_de_simple_key() {
+    fn prefix_range_simple_key() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -1266,7 +1245,7 @@ mod test {
             last_name: "".to_string(),
             age: 42,
         };
-        let pk1: (&str, &str) = ("1", "5627");
+        let pk1 = ("1", "5627");
         map.save(&mut store, pk1, &data1).unwrap();
 
         let data2 = Data {
@@ -1274,7 +1253,7 @@ mod test {
             last_name: "Perez".to_string(),
             age: 13,
         };
-        let pk2: (&str, &str) = ("2", "5628");
+        let pk2 = ("2", "5628");
         map.save(&mut store, pk2, &data2).unwrap();
 
         let data3 = Data {
@@ -1282,7 +1261,7 @@ mod test {
             last_name: "Young".to_string(),
             age: 24,
         };
-        let pk3: (&str, &str) = ("2", "5629");
+        let pk3 = ("2", "5629");
         map.save(&mut store, pk3, &data3).unwrap();
 
         let data4 = Data {
@@ -1290,12 +1269,12 @@ mod test {
             last_name: "Bemberg".to_string(),
             age: 43,
         };
-        let pk4: (&str, &str) = ("3", "5630");
+        let pk4 = ("3", "5630");
         map.save(&mut store, pk4, &data4).unwrap();
 
-        // let's try to iterate!
+        // let's prefix-range and iterate
         let result: StdResult<Vec<_>> = map
-            .prefix_range_de(
+            .prefix_range(
                 &store,
                 Some(PrefixBound::inclusive("2")),
                 None,
@@ -1312,9 +1291,9 @@ mod test {
             ]
         );
 
-        // let's try to iterate over a range
+        // let's try to iterate over a more restrictive prefix-range!
         let result: StdResult<Vec<_>> = map
-            .prefix_range_de(
+            .prefix_range(
                 &store,
                 Some(PrefixBound::inclusive("2")),
                 Some(PrefixBound::exclusive("3")),
@@ -1333,15 +1312,11 @@ mod test {
 
     #[test]
     #[cfg(feature = "iterator")]
-    fn prefix_range_de_triple_key() {
+    fn prefix_range_triple_key() {
         let mut store = MockStorage::new();
 
         let indexes = DataCompositeMultiIndex {
-            name_age: MultiIndex::new(
-                |d, k| index_triple(&d.name, d.age, k),
-                "data",
-                "data__name_age",
-            ),
+            name_age: MultiIndex::new(|d| index_tuple(&d.name, d.age), "data", "data__name_age"),
         };
         let map = IndexedMap::new("data", indexes);
 
@@ -1351,7 +1326,7 @@ mod test {
             last_name: "".to_string(),
             age: 42,
         };
-        let pk1: (&str, &str, &str) = ("1", "1", "5627");
+        let pk1 = ("1", "1", "5627");
         map.save(&mut store, pk1, &data1).unwrap();
 
         let data2 = Data {
@@ -1359,7 +1334,7 @@ mod test {
             last_name: "Perez".to_string(),
             age: 13,
         };
-        let pk2: (&str, &str, &str) = ("1", "2", "5628");
+        let pk2 = ("1", "2", "5628");
         map.save(&mut store, pk2, &data2).unwrap();
 
         let data3 = Data {
@@ -1367,7 +1342,7 @@ mod test {
             last_name: "Young".to_string(),
             age: 24,
         };
-        let pk3: (&str, &str, &str) = ("2", "1", "5629");
+        let pk3 = ("2", "1", "5629");
         map.save(&mut store, pk3, &data3).unwrap();
 
         let data4 = Data {
@@ -1375,12 +1350,12 @@ mod test {
             last_name: "Bemberg".to_string(),
             age: 43,
         };
-        let pk4: (&str, &str, &str) = ("2", "2", "5630");
+        let pk4 = ("2", "2", "5630");
         map.save(&mut store, pk4, &data4).unwrap();
 
         // let's prefix-range and iterate
         let result: StdResult<Vec<_>> = map
-            .prefix_range_de(
+            .prefix_range(
                 &store,
                 Some(PrefixBound::inclusive(("1", "2"))),
                 None,
@@ -1408,7 +1383,7 @@ mod test {
 
         // let's prefix-range over inclusive bounds on both sides
         let result: StdResult<Vec<_>> = map
-            .prefix_range_de(
+            .prefix_range(
                 &store,
                 Some(PrefixBound::inclusive(("1", "2"))),
                 Some(PrefixBound::inclusive(("2", "1"))),
@@ -1431,11 +1406,64 @@ mod test {
         );
     }
 
-    mod inclusive_bound {
+    mod bounds_unique_index {
         use super::*;
 
         struct Indexes<'a> {
-            secondary: MultiIndex<'a, (u64, Vec<u8>), u64>,
+            secondary: UniqueIndex<'a, u64, u64>,
+        }
+
+        impl<'a> IndexList<u64> for Indexes<'a> {
+            fn get_indexes(&'_ self) -> Box<dyn Iterator<Item = &'_ dyn Index<u64>> + '_> {
+                let v: Vec<&dyn Index<u64>> = vec![&self.secondary];
+                Box::new(v.into_iter())
+            }
+        }
+
+        #[test]
+        #[cfg(feature = "iterator")]
+        fn composite_key_query() {
+            let indexes = Indexes {
+                secondary: UniqueIndex::new(|secondary| *secondary, "test_map__secondary"),
+            };
+            let map = IndexedMap::<&str, u64, Indexes>::new("test_map", indexes);
+            let mut store = MockStorage::new();
+
+            map.save(&mut store, "one", &1).unwrap();
+            map.save(&mut store, "two", &2).unwrap();
+            map.save(&mut store, "three", &3).unwrap();
+
+            // Inclusive bound
+            let items: Vec<_> = map
+                .idx
+                .secondary
+                .range_raw(&store, None, Some(Bound::inclusive(1u64)), Order::Ascending)
+                .collect::<Result<_, _>>()
+                .unwrap();
+
+            // Strip the index from values (for simpler comparison)
+            let items: Vec<_> = items.into_iter().map(|(_, v)| v).collect();
+
+            assert_eq!(items, vec![1]);
+
+            // Exclusive bound
+            let items: Vec<_> = map
+                .idx
+                .secondary
+                .range(&store, Some(Bound::exclusive(2u64)), None, Order::Ascending)
+                .collect::<Result<_, _>>()
+                .unwrap();
+
+            assert_eq!(items, vec![((), 3)]);
+        }
+    }
+
+    mod bounds_multi_index {
+        use super::*;
+
+        struct Indexes<'a> {
+            // The last type param must match the `IndexedMap` primary key type, below
+            secondary: MultiIndex<'a, u64, u64, &'a str>,
         }
 
         impl<'a> IndexList<u64> for Indexes<'a> {
@@ -1450,7 +1478,7 @@ mod test {
         fn composite_key_query() {
             let indexes = Indexes {
                 secondary: MultiIndex::new(
-                    |secondary, k| (*secondary, k),
+                    |secondary| *secondary,
                     "test_map",
                     "test_map__secondary",
                 ),
@@ -1460,11 +1488,14 @@ mod test {
 
             map.save(&mut store, "one", &1).unwrap();
             map.save(&mut store, "two", &2).unwrap();
+            map.save(&mut store, "two2", &2).unwrap();
+            map.save(&mut store, "three", &3).unwrap();
 
+            // Inclusive prefix-bound
             let items: Vec<_> = map
                 .idx
                 .secondary
-                .prefix_range(
+                .prefix_range_raw(
                     &store,
                     None,
                     Some(PrefixBound::inclusive(1u64)),
@@ -1477,6 +1508,25 @@ mod test {
             let items: Vec<_> = items.into_iter().map(|(_, v)| v).collect();
 
             assert_eq!(items, vec![1]);
+
+            // Exclusive bound (used for pagination)
+            // Range over the index specifying a primary key (multi-index key includes the pk)
+            let items: Vec<_> = map
+                .idx
+                .secondary
+                .range(
+                    &store,
+                    Some(Bound::exclusive((2u64, "two"))),
+                    None,
+                    Order::Ascending,
+                )
+                .collect::<Result<_, _>>()
+                .unwrap();
+
+            assert_eq!(
+                items,
+                vec![("two2".to_string(), 2), ("three".to_string(), 3)]
+            );
         }
     }
 }

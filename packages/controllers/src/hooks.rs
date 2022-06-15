@@ -4,14 +4,15 @@ use std::fmt;
 use thiserror::Error;
 
 use cosmwasm_std::{
-    attr, Addr, Deps, DepsMut, MessageInfo, Response, StdError, StdResult, Storage, SubMsg,
+    attr, Addr, CustomQuery, Deps, DepsMut, MessageInfo, Response, StdError, StdResult, Storage,
+    SubMsg,
 };
 use cw_storage_plus::Item;
 
 use crate::admin::{Admin, AdminError};
 
 // this is copied from cw4
-// TODO: pull into cw0 as common dep
+// TODO: pull into utils as common dep
 #[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, Debug)]
 pub struct HooksResponse {
     pub hooks: Vec<String>,
@@ -73,10 +74,10 @@ impl<'a> Hooks<'a> {
             .collect()
     }
 
-    pub fn execute_add_hook<C>(
+    pub fn execute_add_hook<C, Q: CustomQuery>(
         &self,
         admin: &Admin,
-        deps: DepsMut,
+        deps: DepsMut<Q>,
         info: MessageInfo,
         addr: Addr,
     ) -> Result<Response<C>, HookError>
@@ -94,10 +95,10 @@ impl<'a> Hooks<'a> {
         Ok(Response::new().add_attributes(attributes))
     }
 
-    pub fn execute_remove_hook<C>(
+    pub fn execute_remove_hook<C, Q: CustomQuery>(
         &self,
         admin: &Admin,
-        deps: DepsMut,
+        deps: DepsMut<Q>,
         info: MessageInfo,
         addr: Addr,
     ) -> Result<Response<C>, HookError>
@@ -115,7 +116,7 @@ impl<'a> Hooks<'a> {
         Ok(Response::new().add_attributes(attributes))
     }
 
-    pub fn query_hooks(&self, deps: Deps) -> StdResult<HooksResponse> {
+    pub fn query_hooks<Q: CustomQuery>(&self, deps: Deps<Q>) -> StdResult<HooksResponse> {
         let hooks = self.0.may_load(deps.storage)?.unwrap_or_default();
         let hooks = hooks.into_iter().map(String::from).collect();
         Ok(HooksResponse { hooks })

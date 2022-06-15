@@ -2,13 +2,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use cosmwasm_std::{CosmosMsg, Empty};
-use cw0::{Duration, Expiration};
 use cw3::Vote;
+use cw_utils::{Duration, Expiration, Threshold};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, JsonSchema, Debug)]
 pub struct InstantiateMsg {
     pub voters: Vec<Voter>,
-    pub required_weight: u64,
+    pub threshold: Threshold,
     pub max_voting_period: Duration,
 }
 
